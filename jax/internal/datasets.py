@@ -146,7 +146,7 @@ class NeRFSceneManager(pycolmap.SceneManager):
       params['k4'] = cam.k4
       camtype = camera_utils.ProjectionType.FISHEYE
 
-    return names, poses, pixtocam, params, camtype
+    return names, poses, pixtocam, params, camtype, cam.width, cam.height
 
 
 def load_blender_posedata(data_dir, split=None):
@@ -183,7 +183,7 @@ def load_blender_posedata(data_dir, split=None):
   else:
     params = {c: (meta[c] if c in meta else 0.) for c in coeffs}
   camtype = camera_utils.ProjectionType.PERSPECTIVE
-  return names, poses, pixtocam, params, camtype
+  return names, poses, pixtocam, params, camtype, w, h
 
 
 class Dataset(threading.Thread, metaclass=abc.ABCMeta):
@@ -525,6 +525,8 @@ class Blender(Dataset):
         image = utils.load_img(fprefix + f)
         if config.factor > 1:
           image = lib_image.downsample(image, config.factor)
+        elif config.factor == -1:
+          image = lib_image.resize_image_to_long_size(image, config.long_side_size)
         return image
 
       if self._use_tiffs:
@@ -565,6 +567,15 @@ class LLFF(Dataset):
 
   def _load_renderings(self, config):
     """Load images from disk."""
+    # Copy COLMAP data to local disk for faster loading.
+    colmap_dir = os.path.join(self.data_dir, 'sparse/0/')
+    # Load poses.
+    if utils.file_exists(colmap_dir):
+      pose_data = NeRFSceneManager(colmap_dir).process()
+    else:
+      # Attempt to load Blender/NGP format if COLMAP data not present.
+      pose_data = load_blender_posedata(self.data_dir)
+    image_names, poses, pixtocam, distortion_params, camtype, img_width, img_height = pose_data
     # Set up scaling factor.
     image_dir_suffix = ''
     # Use downsampling factor (unless loading training split for raw dataset,
@@ -573,19 +584,11 @@ class LLFF(Dataset):
                                   self.split == utils.DataSplit.TRAIN):
       image_dir_suffix = f'_{config.factor}'
       factor = config.factor
+    elif config.factor == -1:
+      factor = max(img_width, img_height) / config.long_side_size
+      print(f'Downsampling images to long side size {config.long_side_size}, factor = {factor}.')
     else:
       factor = 1
-
-    # Copy COLMAP data to local disk for faster loading.
-    colmap_dir = os.path.join(self.data_dir, 'sparse/0/')
-
-    # Load poses.
-    if utils.file_exists(colmap_dir):
-      pose_data = NeRFSceneManager(colmap_dir).process()
-    else:
-      # Attempt to load Blender/NGP format if COLMAP data not present.
-      pose_data = load_blender_posedata(self.data_dir)
-    image_names, poses, pixtocam, distortion_params, camtype = pose_data
 
     # Previous NeRF results were generated with images sorted by filename,
     # use this flag to ensure metrics are reported on the same test set.
@@ -595,7 +598,10 @@ class LLFF(Dataset):
       poses = poses[inds]
 
     # Scale the inverse intrinsics matrix by the image downsampling factor.
+    print(f'Using downsampling factor {factor}.')
+    print(pixtocam)
     pixtocam = pixtocam @ np.diag([factor, factor, 1.])
+    print(pixtocam)
     self.pixtocams = pixtocam.astype(np.float32)
     self.focal = 1. / self.pixtocams[0, 0]
     self.distortion_params = distortion_params
@@ -627,8 +633,10 @@ class LLFF(Dataset):
       image_paths = [os.path.join(image_dir, colmap_to_image[f])
                      for f in image_names]
       images = [utils.load_img(x) for x in image_paths]
+      if config.factor == -1:
+        images = [lib_image.resize_image_to_long_size(image, config.long_side_size) for image in images]
       images = np.stack(images, axis=0) / 255.
-
+      print("Size of Images: " + str(images.shape))
       # EXIF data is usually only present in the original JPEG images.
       jpeg_paths = [os.path.join(colmap_image_dir, f) for f in image_names]
       exifs = [utils.load_exif(x) for x in jpeg_paths]
@@ -697,15 +705,61 @@ class LLFF(Dataset):
     if config.llff_use_all_images_for_training or raw_testscene:
       train_indices = all_indices
     else:
-      train_indices = all_indices % config.llffhold != 0
-    split_indices = {
-        utils.DataSplit.TEST: all_indices[all_indices % config.llffhold == 0],
-        utils.DataSplit.TRAIN: train_indices,
-    }
-    indices = split_indices[self.split]
-    # All per-image quantities must be re-indexed using the split indices.
-    images = images[indices]
-    poses = poses[indices]
+      if not config.random_split:
+        split_dir = os.path.join(self.data_dir, 'splits')
+
+        def load_split_file(file_path):
+          """
+          This function loads data from a text file and stores it in a list.
+          Each line from the file is stored as a separate item in the list.
+
+          :param file_path: Path to the text file.
+          :return: A list containing each line from the file.
+          """
+          second_entries = []
+          with open(file_path, 'r') as file:
+              for line in file:
+                  entries = line.strip().split(',')
+                  if len(entries) > 1:
+                      second_entries.append(entries[1])
+          return second_entries
+
+        train_set_images = load_split_file(os.path.join(split_dir, config.train_set_split_name))
+        test_set_images = load_split_file(os.path.join(split_dir, config.test_set_split_name))
+
+        # Debugging prints
+        print("Loaded", len(train_set_images), "train set images. Examples:", train_set_images[:5])
+        print("Loaded", len(test_set_images), "test set images. Examples:", test_set_images[:5])
+        image_names_no_ext = [os.path.splitext(x)[0] for x in image_names]
+        print("Image names no ext count:", len(image_names_no_ext), "Examples:", image_names_no_ext[:5])
+        train_indices = [index for index, image_name in enumerate(image_names_no_ext) if image_name in train_set_images]
+        test_indices = [index for index, image_name in enumerate(image_names_no_ext) if image_name in test_set_images]
+
+        # More debugging prints
+        print("Train indices count:", len(train_indices), "Examples:", train_indices[:5])
+        print("Test indices count:", len(test_indices), "Examples:", test_indices[:5])
+
+        train_indices_set = set(train_indices)
+        test_indices_set = set(test_indices)
+
+        # Remove indices from train_indices that are also in test_indices
+        unique_train_indices = train_indices_set - test_indices_set
+
+        # Convert back to list and print final count
+        train_indices = list(unique_train_indices)
+        print("Unique train indices count after removing duplicates:", len(train_indices), "Examples:", train_indices[:5])
+      else:
+        train_indices = all_indices % config.llffhold != 0
+        test_indices = all_indices[all_indices % config.llffhold == 0]
+
+      split_indices = {
+          utils.DataSplit.TEST: test_indices,
+          utils.DataSplit.TRAIN: train_indices,
+      }
+      indices = split_indices[self.split]
+      # All per-image quantities must be re-indexed using the split indices.
+      images = images[indices]
+      poses = poses[indices]
     if self.exposures is not None:
       self.exposures = self.exposures[indices]
     if config.rawnerf_mode:
